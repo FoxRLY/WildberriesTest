@@ -18,7 +18,7 @@ services:
       retries: 5
       start_period: 10s
     ports:
-      - 5432:5432
+      - "5432:5432"
   # postgres_test:
   #   container_name: ${TEST_DB_CONTAINER_NAME}
   #   image: postgres:latest
@@ -27,7 +27,7 @@ services:
   #     - POSTGRES_USER=username
   #     - POSTGRES_PASSWORD=password
   #   ports:
-  #     - "8081:5432"
+  #     - "5432:5432"
   app:
     container_name: ${APP_CONTAINER_NAME}
     build: .
