@@ -1,9 +1,9 @@
 use actix_web::dev::ServiceResponse;
 use actix_web::{get, put, post, App, HttpServer, Responder, HttpResponse, web};
-use super::postgres_client::DBClient;
-use super::models::{UncheckedEmployeeName, UncheckedSalaryMultiplier, UncheckedEmployeeData};
+use std::sync::Arc;
+use super::postgres_client::{DBClientPostgres, DBClient, MockDBClient};
+use super::models::{UncheckedEmployeeName, UncheckedSalaryMultiplier, UncheckedEmployeeData, EmployeeSalary};
 use std::error::Error;
-use std::sync::Mutex;
 use log::{info, error};
 use simplelog::{CombinedLogger, Config, LevelFilter, WriteLogger};
 use std::fs::File;
@@ -15,8 +15,8 @@ use std::fs::File;
 ///
 /// Пример: /salary?name="Василий Петрович"
 #[get("/salary")]
-async fn get_employee_salary(query: web::Query<UncheckedEmployeeName>, db_client: web::Data<Mutex<DBClient>>) -> impl Responder {
-    let db_client = db_client.lock().unwrap();
+async fn get_employee_salary(query: web::Query<UncheckedEmployeeName>, db_client: web::Data<dyn DBClient>) -> impl Responder {
+    // let db_client = db_client.lock().unwrap();
     let employee_name = match query.into_inner().check(){
         Ok(name) => name,
         Err(e) => {
@@ -41,8 +41,8 @@ async fn get_employee_salary(query: web::Query<UncheckedEmployeeName>, db_client
 ///
 /// Пример: /add?name="Василий Петрович"&salary=8000
 #[put("/add")]
-async fn add_new_employee(query: web::Query<UncheckedEmployeeData>, db_client: web::Data<Mutex<DBClient>>) -> impl Responder {
-    let db_client = db_client.lock().unwrap();
+async fn add_new_employee(query: web::Query<UncheckedEmployeeData>, db_client: web::Data<dyn DBClient>) -> impl Responder {
+    // let db_client = db_client.lock().unwrap();
     let employee_data = match query.into_inner().check(){
         Ok(data) => data,
         Err(e) => {
@@ -67,8 +67,8 @@ async fn add_new_employee(query: web::Query<UncheckedEmployeeData>, db_client: w
 ///
 /// Пример: /increase?name="Василий Петрович"&percentage=20
 #[post("/increase")]
-async fn increase_employee_salary(query: web::Query<UncheckedSalaryMultiplier>, db_client: web::Data<Mutex<DBClient>>) -> impl Responder {
-    let db_client = db_client.lock().unwrap();
+async fn increase_employee_salary(query: web::Query<UncheckedSalaryMultiplier>, db_client: web::Data<dyn DBClient>) -> impl Responder {
+    // let db_client = db_client.lock().unwrap();
     let salary_multiplier = match query.into_inner().check(){
         Ok(multiplier) => multiplier,
         Err(e) => {
@@ -121,12 +121,13 @@ impl Server{
             ]
         ).unwrap();
 
-        let postgres_client = DBClient::new().await?;
+        let postgres_client = DBClientPostgres::new().await?;
         postgres_client.init_db().await?;
-        let postgres_client = web::Data::new(Mutex::new(postgres_client));
+        let postgres_client: Arc<dyn DBClient> = Arc::new(postgres_client);
+        let data: web::Data<dyn DBClient> = web::Data::from(postgres_client);
         HttpServer::new(move || {
             App::new()
-                .app_data(postgres_client.clone())
+                .app_data(data.clone())
                 .service(
                     web::scope("/employee")
                         .service(increase_employee_salary)
@@ -139,13 +140,45 @@ impl Server{
         .await?;
         Ok(())
     }
-    
+
     pub async fn test_start(self) -> Result<impl actix_service::Service<actix_http::Request, Response = ServiceResponse, Error = actix_web::Error>, Box<dyn Error>> {
-        let postgres_client = DBClient::new_test().await?;
-        postgres_client.init_db_clear().await?;
-        let postgres_client = web::Data::new(Mutex::new(postgres_client));
+        let mut mock_client = MockDBClient::new();
+        
+        // В базе хранится только запись о Test Employee
+        mock_client.expect_get_employee_salary()
+            .returning(|name|{
+                match &*(name.name){
+                    "Test Employee" => {Ok(EmployeeSalary{amount: 100})},
+                    _ => {Err("bruh".into())}
+                }
+            });
+
+        // В базу можно добавить только Test Employee, все остальные заняты
+        mock_client.expect_add_new_employee()
+            .returning(|data|{
+                match &*(data.name){
+                    "Test Employee" => {Ok(())},
+                    _ => {Err("bruh".into())}
+                }
+            });
+
+        // Увеличить зарплату можно только для Test Employee
+        mock_client.expect_increase_employee_salary()
+            .returning(|data| {
+                let mut salary = EmployeeSalary{amount: 100};
+                match &*(data.name){
+                    "Test Employee" => {
+                        Ok(
+                            salary.increase_by_percentage(&data).unwrap()
+                        )
+                    },
+                    _ => {Err("bruh".into())}
+                }
+            });
+        let a: Arc<dyn DBClient> = Arc::new(mock_client);
+        let data: web::Data<dyn DBClient> = web::Data::from(a);
         let app = actix_web::test::init_service(App::new()
-            .app_data(postgres_client.clone())
+            .app_data(data)
             .service(
                 web::scope("/employee")
                     .service(increase_employee_salary)
@@ -187,8 +220,6 @@ mod tests {
     use serial_test::serial;
     use actix_service::Service;
     use actix_web::http::StatusCode;
-    use crate::models::{EmployeeName, EmployeeData};
-
     use super::*;
 
     fn set_env_vars(){
@@ -199,7 +230,6 @@ mod tests {
     #[serial]
     async fn test_employee_addition() {
         set_env_vars();
-        let db_client = DBClient::new_test().await.unwrap();
         let app = Server::builder()
             .host("localhost".to_owned())
             .port(8080)
@@ -213,8 +243,6 @@ mod tests {
         let response = app.call(request).await.unwrap();
         let response_status = response.status();
         assert_eq!(response_status, StatusCode::OK);
-        let salary = db_client.get_employee_salary(EmployeeName{name: "Test Employee".to_owned()}).await.unwrap();
-        assert_eq!(2000, salary.amount);
     }
 
     #[actix_web::test]
@@ -279,7 +307,6 @@ mod tests {
     #[serial]
     async fn test_employee_salary_getter() {
         set_env_vars();
-        let db_client = DBClient::new_test().await.unwrap();
         let app = Server::builder()
             .host("localhost".to_owned())
             .port(8080)
@@ -287,7 +314,6 @@ mod tests {
             .test_start()
             .await
             .unwrap();
-        db_client.add_new_employee(EmployeeData{name: "Test Employee".to_owned(), salary: 100}).await.unwrap();
         let request = actix_web::test::TestRequest::get()
             .uri("/employee/salary?name=Test%20Employee")
             .to_request();
@@ -305,7 +331,6 @@ mod tests {
     #[serial]
     async fn test_employee_salary_getter_failing() {
         set_env_vars();
-        let db_client = DBClient::new_test().await.unwrap();
         let app = Server::builder()
             .host("localhost".to_owned())
             .port(8080)
@@ -313,7 +338,6 @@ mod tests {
             .test_start()
             .await
             .unwrap();
-        db_client.add_new_employee(EmployeeData{name: "Test Employee".to_owned(), salary: 100}).await.unwrap();
         let request = actix_web::test::TestRequest::get()
             .uri("/employee/salary?name=Tost%20Empliyep")
             .to_request();
@@ -326,7 +350,6 @@ mod tests {
     #[serial]
     async fn test_employee_increase_salary(){
         set_env_vars();
-        let db_client = DBClient::new_test().await.unwrap();
         let app = Server::builder()
             .host("localhost".to_owned())
             .port(8080)
@@ -334,7 +357,6 @@ mod tests {
             .test_start()
             .await
             .unwrap();
-        db_client.add_new_employee(EmployeeData{name: "Test Employee".to_owned(), salary: 100}).await.unwrap();
         let request = actix_web::test::TestRequest::post()
             .uri("/employee/increase?name=Test%20Employee&percentage=25")
             .to_request();
@@ -345,15 +367,12 @@ mod tests {
         let response_body = String::from_utf8(response_body.to_vec()).unwrap();
         let response_body: i32 = response_body.trim().parse().unwrap();
         assert_eq!(100, response_body);
-        let new_salary = db_client.get_employee_salary(EmployeeName { name: "Test Employee".to_owned() }).await.unwrap();
-        assert_eq!(125, new_salary.amount);
     }
 
     #[actix_web::test]
     #[serial]
     async fn test_employee_increase_salary_failing_1(){
         set_env_vars();
-        let db_client = DBClient::new_test().await.unwrap();
         let app = Server::builder()
             .host("localhost".to_owned())
             .port(8080)
@@ -361,7 +380,6 @@ mod tests {
             .test_start()
             .await
             .unwrap();
-        db_client.add_new_employee(EmployeeData{name: "Test Employee".to_owned(), salary: 100}).await.unwrap();
         let request = actix_web::test::TestRequest::post()
             .uri("/employee/increase?name=Tust%20Mmployee&percentage=25")
             .to_request();
@@ -374,7 +392,6 @@ mod tests {
     #[serial]
     async fn test_employee_increase_salary_failing_2(){
         set_env_vars();
-        let db_client = DBClient::new_test().await.unwrap();
         let app = Server::builder()
             .host("localhost".to_owned())
             .port(8080)
@@ -382,7 +399,6 @@ mod tests {
             .test_start()
             .await
             .unwrap();
-        db_client.add_new_employee(EmployeeData{name: "Test Employee".to_owned(), salary: 100}).await.unwrap();
         let request = actix_web::test::TestRequest::post()
             .uri("/employee/increase?name=Test%20Employee&percentage=0")
             .to_request();
@@ -395,7 +411,6 @@ mod tests {
     #[serial]
     async fn test_employee_increase_salary_failing_3(){
         set_env_vars();
-        let db_client = DBClient::new_test().await.unwrap();
         let app = Server::builder()
             .host("localhost".to_owned())
             .port(8080)
@@ -403,7 +418,6 @@ mod tests {
             .test_start()
             .await
             .unwrap();
-        db_client.add_new_employee(EmployeeData{name: "Test Employee".to_owned(), salary: 100}).await.unwrap();
         let request = actix_web::test::TestRequest::post()
             .uri("/employee/increase?name=Tust%20Mmployee&percentage=-31")
             .to_request();
